@@ -8,9 +8,9 @@ Gem::Specification.new do |spec|
   spec.authors = ["Nicolas J Jensen"]
   spec.email = ["nicolasjensen9@gmail.com"]
 
-  spec.summary = "Stateless one-time-password and one-time-link issuance for Ruby."
-  spec.description = "Issue and consume OTPs and signed links without any database storage. " \
-                     "State lives entirely inside the encrypted token. " \
+  spec.summary = "Encrypted verification codes and links for Ruby."
+  spec.description = "Issue and verify expiring codes and encrypted links. " \
+                     "Applications control delivery, storage, single use, and revocation. " \
                      "Codes are BCrypt-hashed and tokens are encrypted with AES-256-GCM. " \
                      "Purpose namespacing and key rotation are built in."
   spec.homepage = "https://github.com/NicolasJJensen/otp_courier"
@@ -24,7 +24,7 @@ Gem::Specification.new do |spec|
   }
 
   spec.files = Dir.chdir(__dir__) do
-    Dir["lib/**/*", "README.md", "CHANGELOG.md", "LICENSE.txt"]
+    Dir["lib/**/*", "docs/**/*.md", "examples/**/*.rb", "README.md", "CHANGELOG.md", "LICENSE.txt"]
       .select { |f| File.file?(f) }
   end
 

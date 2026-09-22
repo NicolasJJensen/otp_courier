@@ -26,7 +26,22 @@ jobs:
           - rails: "8.1"
             rails_file: "8_1"
             ruby: "3.3"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: otp_courier_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
+      OTP_COURIER_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/otp_courier_test
       BUNDLE_GEMFILE: gemfiles/rails_${{ matrix.rails_file }}.gemfile
     steps:
       - uses: actions/checkout@v4
@@ -39,3 +54,4 @@ jobs:
           bundle lock --update
           bundle install --jobs 4 --retry 3
       - run: bundle exec rspec
+      - run: bundle exec ruby script/check_package.rb
