@@ -54,14 +54,13 @@ RSpec.describe OtpCourier::OTP do
 
     it "rejects an expired token" do
       issued = described_class.issue(purpose: :test, payload: { x: 1 }, validity: 1)
-      sleep 1.1
+      travel 2
 
       expect(described_class.consume(issued.token, issued.code, purpose: :test)).to be_nil
     end
 
     it "rejects an unknown envelope version" do
       issued = described_class.issue(purpose: :test, payload: { x: 1 })
-      # swap "oc1" for "oc2"
       mutated = issued.token.sub(/\Aoc1\./, "oc99.")
 
       expect(described_class.consume(mutated, issued.code, purpose: :test)).to be_nil
@@ -69,9 +68,8 @@ RSpec.describe OtpCourier::OTP do
 
     it "rejects a token whose kid has been retired" do
       issued = described_class.issue(purpose: :test, payload: { x: 1 })
-      OtpCourier.config.secrets.delete("primary")
-      OtpCourier.config.secrets["v2"] = "different-secret"
-      OtpCourier.config.active_kid = "v2"
+      OtpCourier::Keys.rotate!("v2", "different-secret")
+      OtpCourier::Keys.retire!("primary")
 
       expect(described_class.consume(issued.token, issued.code, purpose: :test)).to be_nil
     end
@@ -118,7 +116,7 @@ RSpec.describe OtpCourier::OTP do
 
     it "rejects an expired link" do
       token = described_class.issue_link(purpose: :invite, payload: { x: 1 }, validity: 1)
-      sleep 1.1
+      travel 2
 
       expect(described_class.consume_link(token, purpose: :invite)).to be_nil
     end
@@ -156,7 +154,7 @@ RSpec.describe OtpCourier::OTP do
       OtpCourier.config.for(:fast_expire) { |p| p.default_validity = 1 }
 
       issued = described_class.issue(purpose: :fast_expire, payload: { x: 1 })
-      sleep 1.1
+      travel 2
 
       expect(described_class.consume(issued.token, issued.code, purpose: :fast_expire)).to be_nil
     end
@@ -173,7 +171,7 @@ RSpec.describe OtpCourier::OTP do
       OtpCourier.config.for(:fast_invite) { |p| p.default_validity = 1 }
 
       token = described_class.issue_link(purpose: :fast_invite, payload: { x: 1 })
-      sleep 1.1
+      travel 2
 
       expect(described_class.consume_link(token, purpose: :fast_invite)).to be_nil
     end

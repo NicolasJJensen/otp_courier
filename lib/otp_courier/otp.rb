@@ -4,143 +4,146 @@ require "bcrypt"
 require "securerandom"
 
 module OtpCourier
-  # Stateless one-time-password and one-time-link service.
-  #
-  # The "state" of a pending verification lives entirely inside the encrypted
-  # token returned by `issue` / `issue_link`. Nothing is stored server-side, so
-  # there's no DB churn and no squatting on unverified contacts.
-  #
-  # Tokens are namespaced by `purpose:` to prevent cross-flow replay (e.g. a
-  # 2FA challenge token can't be redeemed against a signup confirmation), and
-  # tagged with `kind` ("otp" vs "link") so a link token can never satisfy an
-  # OTP consume call even with the right purpose.
   module OTP
     Issued = Struct.new(:token, :code, keyword_init: true)
-
-    PAYLOAD_VERSION = 1
-
+    PAYLOAD_VERSION = 2
     KIND_OTP = "otp"
     KIND_LINK = "link"
-
-    # Crockford-style alphanumeric, minus visually ambiguous characters
-    # (I/1, O/0). 32 chars total → ~5 bits per character.
     ALPHANUMERIC_CHARS = (("A".."Z").to_a + ("0".."9").to_a - %w[I O 0 1]).freeze
     DIGIT_CHARS = ("0".."9").to_a.freeze
-
-    CHARSETS = {
-      digits: DIGIT_CHARS,
-      alphanumeric: ALPHANUMERIC_CHARS
-    }.freeze
-
+    CHARSETS = { digits: DIGIT_CHARS, alphanumeric: ALPHANUMERIC_CHARS }.freeze
     module_function
 
-    # Issue a one-time code. Returns an Issued struct with `token` (give to the
-    # client / store in session) and `code` (deliver out-of-band: email, SMS).
     def issue(purpose:, payload: {}, length: nil, validity: nil, charset: nil)
+      original_purpose = purpose
+      original_payload = payload
+      purpose = Validation.purpose!(purpose)
+      payload = Validation.payload!(payload)
       config = OtpCourier.config
       defaults = config.defaults_for(purpose)
-      length ||= defaults.length
-      validity ||= defaults.validity
-      charset ||= defaults.charset
-
-      invoke_before_issue(purpose, payload)
-
+      length = Validation.length!(length.nil? ? defaults.length : length)
+      validity = Validation.validity!(validity.nil? ? defaults.validity : validity)
+      charset = Validation.charset!(charset.nil? ? defaults.charset : charset)
+      expires_at = expiry_for(validity)
+      invoke_before_issue(original_purpose, original_payload)
       code = generate_code(length, charset)
       digest = BCrypt::Password.create(code, cost: config.bcrypt_cost).to_s
-
       token = Encoder.encrypt(
         {
           "v" => PAYLOAD_VERSION,
           "kind" => KIND_OTP,
-          "payload" => stringify(payload),
+          "payload" => payload,
           "digest" => digest,
-          "nonce" => SecureRandom.hex(16)
+          "nonce" => SecureRandom.hex(16),
+          "expires_at" => expires_at
         },
-        purpose: purpose,
-        expires_in: validity
+        purpose: purpose
       )
-
       Issued.new(token: token, code: code)
     end
 
-    # Issue a one-time link token (no code; the secret is the URL itself).
     def issue_link(purpose:, payload: {}, validity: nil)
-      validity ||= OtpCourier.config.defaults_for(purpose).validity
-
-      invoke_before_issue(purpose, payload)
-
+      original_purpose = purpose
+      original_payload = payload
+      purpose = Validation.purpose!(purpose)
+      payload = Validation.payload!(payload)
+      defaults = OtpCourier.config.defaults_for(purpose)
+      validity = Validation.validity!(validity.nil? ? defaults.validity : validity)
+      expires_at = expiry_for(validity)
+      invoke_before_issue(original_purpose, original_payload)
       Encoder.encrypt(
         {
           "v" => PAYLOAD_VERSION,
           "kind" => KIND_LINK,
-          "payload" => stringify(payload),
-          "nonce" => SecureRandom.hex(16)
+          "payload" => payload,
+          "nonce" => SecureRandom.hex(16),
+          "expires_at" => expires_at
         },
-        purpose: purpose,
-        expires_in: validity
+        purpose: purpose
       )
     end
 
-    # Verify a token + code pair. Returns the stored payload (Hash, string
-    # keys) on success, or nil on any failure (expired, wrong purpose,
-    # tampered, wrong code, wrong kind, wrong payload version, blank input).
     def consume(token, code, purpose:)
-      return nil if blank?(token) || blank?(code)
+      consume!(token, code, purpose: purpose)
+    rescue OtpCourier::VerificationError
+      nil
+    end
 
+    def consume!(token, code, purpose:)
+      purpose = Validation.purpose!(purpose)
+      raise InvalidToken, "Token is invalid" if blank?(token)
       data = decrypt_and_check(token, purpose: purpose, kind: KIND_OTP)
-      return nil unless data
-
+      raise ExpiredToken, "Token has expired" if expired?(data)
       digest = data["digest"]
-      return nil unless digest.is_a?(String) && !digest.empty?
-
+      raise InvalidToken, "Token is invalid" unless digest.is_a?(String) && !digest.empty?
+      validate_code!(code)
       begin
-        return nil unless BCrypt::Password.new(digest) == code.to_s
+        raise InvalidCode, "Code is invalid" unless BCrypt::Password.new(digest) == code
       rescue BCrypt::Errors::InvalidHash
-        return nil
+        raise InvalidToken, "Token is invalid"
       end
-
-      data["payload"] || {}
+      data["payload"]
     end
 
-    # Verify a link token. Returns the stored payload on success, nil
-    # otherwise.
     def consume_link(token, purpose:)
-      return nil if blank?(token)
-
-      data = decrypt_and_check(token, purpose: purpose, kind: KIND_LINK)
-      return nil unless data
-
-      data["payload"] || {}
+      consume_link!(token, purpose: purpose)
+    rescue OtpCourier::VerificationError
+      nil
     end
 
-    # --- internal --------------------------------------------------------
+    def consume_link!(token, purpose:)
+      purpose = Validation.purpose!(purpose)
+      raise InvalidToken, "Token is invalid" if blank?(token)
+      data = decrypt_and_check(token, purpose: purpose, kind: KIND_LINK)
+      raise ExpiredToken, "Token has expired" if expired?(data)
+      data["payload"]
+    end
 
     def decrypt_and_check(token, purpose:, kind:)
       data = Encoder.decrypt(token, purpose: purpose)
-      return nil unless data.is_a?(Hash)
-      return nil unless data["kind"] == kind
-      return nil unless data["v"] == PAYLOAD_VERSION
+      raise InvalidToken, "Token is invalid" unless data.is_a?(Hash)
+      raise InvalidToken, "Token is invalid" unless data["kind"] == kind && data["v"] == PAYLOAD_VERSION
+      raise InvalidToken, "Token is invalid" unless data["payload"].is_a?(Hash)
+      expires_at = data["expires_at"]
+      raise InvalidToken, "Token is invalid" unless expires_at.is_a?(Numeric) && expires_at.finite?
       data
     end
 
     def generate_code(length, charset)
-      chars = CHARSETS[charset] || DIGIT_CHARS
+      chars = CHARSETS.fetch(charset)
       Array.new(length) { chars[SecureRandom.random_number(chars.length)] }.join
     end
 
-    def stringify(hash)
-      return {} if hash.nil?
-      hash.each_with_object({}) { |(k, v), out| out[k.to_s] = v }
+    def expiry_for(validity)
+      now = Time.now.to_f
+      expires_at = now + validity
+      unless expires_at.finite? && expires_at > now
+        raise ArgumentError, "validity must produce a finite future expiry"
+      end
+      expires_at
+    end
+
+    def expired?(data)
+      Time.now.to_f >= data["expires_at"]
     end
 
     def blank?(value)
       value.nil? || (value.respond_to?(:empty?) && value.empty?)
     end
 
+    def validate_code!(code)
+      unless code.is_a?(String) && code.bytesize <= Validation::MAX_LENGTH &&
+             code.ascii_only? && code.match?(/\A[0-9A-Z]+\z/)
+        raise InvalidCode, "Code is invalid"
+      end
+    end
+
     def invoke_before_issue(purpose, payload)
       hook = OtpCourier.config.before_issue
-      return unless hook
-      hook.call(purpose, payload)
+      hook.call(purpose, payload) if hook
     end
+
+    private_class_method :decrypt_and_check, :generate_code, :expired?, :blank?,
+                         :validate_code!, :invoke_before_issue, :expiry_for
   end
 end

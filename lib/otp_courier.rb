@@ -2,6 +2,11 @@
 
 module OtpCourier
   class Error < StandardError; end
+  class ConfigurationError < Error; end
+  class VerificationError < Error; end
+  class InvalidToken < VerificationError; end
+  class ExpiredToken < VerificationError; end
+  class InvalidCode < VerificationError; end
 
   class << self
     def configure
@@ -19,6 +24,7 @@ module OtpCourier
 end
 
 require "otp_courier/version"
+require "otp_courier/validation"
 require "otp_courier/configuration"
 require "otp_courier/encoder"
 require "otp_courier/otp"
