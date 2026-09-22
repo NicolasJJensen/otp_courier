@@ -34,18 +34,18 @@ RSpec.describe OtpCourier::Configuration do
     end
   end
 
-  describe "#secret!" do
+  describe "#active_secret!" do
     it "returns the active secret when set" do
       config = described_class.new
       config.secret = "abc"
 
-      expect(config.secret!).to eq("abc")
+      expect(config.active_secret!).to eq("abc")
     end
 
     it "raises a clear error when nothing is configured and Rails isn't present" do
       config = described_class.new
 
-      expect { config.secret! }.to raise_error(OtpCourier::Error, /no secret/i)
+      expect { config.active_secret! }.to raise_error(OtpCourier::Error, /no secret/i)
     end
   end
 
@@ -69,7 +69,7 @@ RSpec.describe OtpCourier::Configuration do
 
     it "rejects unknown charsets" do
       config = described_class.new
-      expect { config.code_charset = :hex }.to raise_error(ArgumentError, /code_charset/)
+      expect { config.code_charset = :hex }.to raise_error(ArgumentError, /charset/)
     end
   end
 
@@ -126,5 +126,58 @@ RSpec.describe OtpCourier do
 
       expect(described_class.config.default_length).to eq(6)
     end
+  end
+end
+
+RSpec.describe "Configuration validation" do
+  {
+    default_length: [0, -1, 73, 2.5, "6", false],
+    default_validity: [0, -1, Float::INFINITY, Float::NAN, "600", false],
+    code_charset: [:hex, "", 7, false]
+  }.each do |option, values|
+    values.each do |value|
+      it "rejects #{option}=#{value.inspect} globally and per purpose" do
+        expect { OtpCourier.config.public_send("#{option}=", value) }.to raise_error(ArgumentError)
+        expect { OtpCourier.config.for(:signup).public_send("#{option}=", value) }.to raise_error(ArgumentError)
+      end
+    end
+  end
+
+  it "normalizes charset strings at both configuration levels" do
+    OtpCourier.config.code_charset = "alphanumeric"
+    OtpCourier.config.for(:signup).code_charset = "digits"
+    expect(OtpCourier.config.code_charset).to eq(:alphanumeric)
+    expect(OtpCourier.config.defaults_for(:signup).charset).to eq(:digits)
+  end
+
+  it "restores inherited purpose defaults when an override is cleared" do
+    defaults = OtpCourier.config.for(:signup)
+    defaults.default_length = 8
+    defaults.default_length = nil
+    expect(defaults.length).to eq(6)
+  end
+
+  it "rejects blank purposes" do
+    expect { OtpCourier.config.for(" ") }.to raise_error(ArgumentError)
+  end
+
+  it "rejects invalid secrets without partially replacing the keyring" do
+    original = OtpCourier.config.secrets
+    expect { OtpCourier.config.secrets = { "valid" => "secret", "invalid.key" => "secret" } }
+      .to raise_error(ArgumentError)
+    expect { OtpCourier.config.secrets = { "valid" => "" } }.to raise_error(ArgumentError)
+    expect(OtpCourier.config.secrets).to eq(original)
+  end
+
+  it "prevents keyring mutation outside configuration methods" do
+    expect { OtpCourier.config.secrets.delete("primary") }.to raise_error(FrozenError)
+    expect { OtpCourier.config.secret.replace("modified") }.to raise_error(FrozenError)
+  end
+
+  it "validates crypto settings and the issuance hook" do
+    expect { OtpCourier.config.bcrypt_cost = 3 }.to raise_error(ArgumentError)
+    expect { OtpCourier.config.bcrypt_cost = 32 }.to raise_error(ArgumentError)
+    expect { OtpCourier.config.salt = "" }.to raise_error(ArgumentError)
+    expect { OtpCourier.config.before_issue = :callback }.to raise_error(ArgumentError)
   end
 end

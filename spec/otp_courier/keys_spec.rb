@@ -60,3 +60,53 @@ RSpec.describe OtpCourier::Keys do
     end
   end
 end
+
+RSpec.describe "Rails key retirement" do
+  before do
+    application = double("Rails application", secret_key_base: "rails-secret" * 8)
+    stub_const("Rails", double("Rails", application: application))
+    OtpCourier.reset!
+    OtpCourier.config.bcrypt_cost = 4
+  end
+
+  it "rejects a token after retiring its implicit Rails key" do
+    issued = OtpCourier::OTP.issue(purpose: :test)
+    OtpCourier::Keys.rotate!("replacement", "replacement-secret")
+    OtpCourier::Keys.retire!("primary")
+
+    expect(OtpCourier.config.secret_for("primary")).to be_nil
+    expect { OtpCourier::OTP.consume!(issued.token, issued.code, purpose: :test) }
+      .to raise_error(OtpCourier::InvalidToken)
+  end
+
+  it "keeps the Rails key retired when it was the only key" do
+    OtpCourier::Keys.retire!("primary")
+
+    expect(OtpCourier.config.secret_for("primary")).to be_nil
+    expect { OtpCourier::OTP.issue(purpose: :test) }.to raise_error(OtpCourier::ConfigurationError)
+  end
+
+  it "disables implicit fallback when an explicit keyring replaces the Rails key" do
+    issued = OtpCourier::OTP.issue(purpose: :test)
+    OtpCourier.config.secrets = { "replacement" => "replacement-secret" }
+    OtpCourier.config.active_kid = "replacement"
+
+    expect(OtpCourier.config.secret_for("primary")).to be_nil
+    expect(OtpCourier::OTP.consume(issued.token, issued.code, purpose: :test)).to be_nil
+  end
+
+  it "allows an explicit secret to restore a retired key" do
+    OtpCourier::Keys.retire!("primary")
+    OtpCourier.config.secret = "replacement-secret"
+
+    issued = OtpCourier::OTP.issue(purpose: :test)
+    expect(OtpCourier::OTP.consume!(issued.token, issued.code, purpose: :test)).to eq({})
+  end
+
+  it "does not change the active key when rotation settings are invalid" do
+    expect { OtpCourier::Keys.rotate!("invalid.key", "secret") }.to raise_error(ArgumentError)
+    expect { OtpCourier::Keys.rotate!("next", "") }.to raise_error(ArgumentError)
+    expect(OtpCourier::Keys.active_kid).to eq("primary")
+    expect(OtpCourier::Keys.kids).to be_empty
+  end
+end

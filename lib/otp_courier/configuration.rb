@@ -1,17 +1,27 @@
 # frozen_string_literal: true
 
 module OtpCourier
-  # Per-purpose override container. Reads fall through to the parent
-  # Configuration when the override isn't set, so you only specify the
-  # values you actually want different.
+  module DefaultOptions
+    attr_reader :default_length, :default_validity, :code_charset
+
+    def default_length=(value)
+      @default_length = value.nil? && is_a?(PurposeDefaults) ? nil : Validation.length!(value)
+    end
+
+    def default_validity=(value)
+      @default_validity = value.nil? && is_a?(PurposeDefaults) ? nil : Validation.validity!(value)
+    end
+
+    def code_charset=(value)
+      @code_charset = value.nil? && is_a?(PurposeDefaults) ? nil : Validation.charset!(value)
+    end
+  end
+
   class PurposeDefaults
-    attr_accessor :default_length, :default_validity, :code_charset
+    include DefaultOptions
 
     def initialize(parent)
       @parent = parent
-      @default_length = nil
-      @default_validity = nil
-      @code_charset = nil
     end
 
     def length
@@ -27,39 +37,30 @@ module OtpCourier
     end
   end
 
-  # Holds all tunable settings for the gem.
-  #
-  # Single-secret apps can still use `config.secret = "..."` — it transparently
-  # stores under the active kid. Multi-key apps configure `config.secrets =
-  # { "v1" => "...", "v2" => "..." }` and pick which is active.
   class Configuration
+    include DefaultOptions
+
     DEFAULT_SALT = "otp_courier/v1"
     DEFAULT_ACTIVE_KID = "primary"
-    CHARSETS = %i[digits alphanumeric].freeze
 
-    attr_accessor :salt, :default_length, :default_validity, :bcrypt_cost,
-                  :code_charset, :before_issue
-    attr_reader :secrets, :active_kid, :purpose_defaults
+    attr_reader :salt, :bcrypt_cost, :before_issue, :secrets, :active_kid
 
     def initialize
-      @secrets = {}
+      @secrets = {}.freeze
+      @retired_kids = []
+      @rails_fallback_enabled = true
       @active_kid = DEFAULT_ACTIVE_KID
       @salt = DEFAULT_SALT
       @default_length = 6
-      @default_validity = 600 # 10 minutes
+      @default_validity = 600
       @bcrypt_cost = 12
       @code_charset = :digits
       @before_issue = nil
       @purpose_defaults = {}
     end
 
-    # Single-secret convenience: stores under the currently-active kid.
     def secret=(value)
-      if value.nil?
-        @secrets.delete(@active_kid)
-      else
-        @secrets[@active_kid] = value
-      end
+      value.nil? ? retire_secret(@active_kid) : add_secret(@active_kid, value)
     end
 
     def secret
@@ -68,62 +69,105 @@ module OtpCourier
 
     def secrets=(map)
       raise ArgumentError, "secrets must be a Hash" unless map.is_a?(Hash)
-      @secrets = map.transform_keys(&:to_s)
+
+      normalized = map.each_with_object({}) do |(kid, secret), result|
+        kid = validate_kid!(kid)
+        raise ArgumentError, "secrets contains duplicate key IDs" if result.key?(kid)
+        result[kid] = validate_secret!(secret)
+      end
+      @secrets = normalized.freeze
+      @rails_fallback_enabled = false
+      @retired_kids -= normalized.keys
     end
 
     def active_kid=(kid)
-      @active_kid = kid.to_s
+      @active_kid = validate_kid!(kid)
     end
 
-    # Look up the secret for a specific kid, falling back to Rails'
-    # `secret_key_base` if the active kid is the default and nothing is set.
+    def add_secret(kid, secret)
+      kid = validate_kid!(kid)
+      secret = validate_secret!(secret)
+      @secrets = @secrets.merge(kid => secret).freeze
+      @retired_kids.delete(kid)
+    end
+
+    def retire_secret(kid)
+      kid = validate_kid!(kid)
+      @secrets = @secrets.reject { |key, _| key == kid }.freeze
+      @retired_kids |= [kid]
+    end
+
     def secret_for(kid)
       kid = kid.to_s
+      return nil if @retired_kids.include?(kid)
+
       @secrets[kid] || rails_fallback(kid)
     end
 
     def active_secret!
       secret_for(@active_kid) ||
-        raise(OtpCourier::Error,
-              "OtpCourier.config has no secret for active kid '#{@active_kid}'. " \
-              "Configure it via OtpCourier.configure { |c| c.secret = ... }.")
+        raise(ConfigurationError, "No secret configured for active key '#{@active_kid}'")
     end
 
-    # Backwards-compatible alias.
-    alias_method :secret!, :active_secret!
+    def salt=(value)
+      raise ArgumentError, "salt must be a nonempty String" unless value.is_a?(String) && !value.strip.empty?
 
-    def code_charset=(value)
-      value = value.to_sym
-      unless CHARSETS.include?(value)
-        raise ArgumentError, "code_charset must be one of #{CHARSETS.inspect}"
+      @salt = value.dup.freeze
+    end
+
+    def bcrypt_cost=(value)
+      unless value.is_a?(Integer) && (4..31).cover?(value)
+        raise ArgumentError, "bcrypt_cost must be an Integer between 4 and 31"
       end
-      @code_charset = value
+
+      @bcrypt_cost = value
     end
 
-    # Configure per-purpose defaults:
-    #
-    #   config.for(:two_factor) do |p|
-    #     p.default_length = 6
-    #     p.default_validity = 30
-    #   end
+    def before_issue=(value)
+      unless value.nil? || value.respond_to?(:call)
+        raise ArgumentError, "before_issue must respond to call"
+      end
+
+      @before_issue = value
+    end
+
     def for(purpose)
-      defaults = (@purpose_defaults[purpose.to_s] ||= PurposeDefaults.new(self))
+      purpose = Validation.purpose!(purpose)
+      defaults = (@purpose_defaults[purpose] ||= PurposeDefaults.new(self))
       yield defaults if block_given?
       defaults
     end
 
-    # Always returns a PurposeDefaults (never nil), so issuance code can call
-    # `.length` / `.validity` / `.charset` without checking.
     def defaults_for(purpose)
-      @purpose_defaults[purpose.to_s] || PurposeDefaults.new(self)
+      @purpose_defaults[Validation.purpose!(purpose)] || PurposeDefaults.new(self)
     end
 
     private
 
+    def validate_kid!(kid)
+      unless (kid.is_a?(String) || kid.is_a?(Symbol)) && kid.to_s.match?(/\A[a-zA-Z0-9_-]+\z/)
+        raise ArgumentError, "key ID must contain only letters, digits, underscores, or hyphens"
+      end
+
+      kid.to_s.dup.freeze
+    end
+
+    def validate_secret!(secret)
+      unless secret.is_a?(String) && !secret.strip.empty?
+        raise ArgumentError, "secret must be a nonempty String"
+      end
+
+      secret.dup.freeze
+    end
+
     def rails_fallback(kid)
-      return nil unless kid == DEFAULT_ACTIVE_KID
+      return nil unless @rails_fallback_enabled && kid == DEFAULT_ACTIVE_KID
       return nil unless defined?(Rails) && Rails.respond_to?(:application) && Rails.application
-      Rails.application.secret_key_base
+
+      secret = Rails.application.secret_key_base
+      return nil if secret.nil?
+
+      validate_secret!(secret)
     end
   end
 end
